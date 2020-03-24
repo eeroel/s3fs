@@ -47,7 +47,6 @@ b = test_bucket_name + '/tmp/test/b'
 c = test_bucket_name + '/tmp/test/c'
 d = test_bucket_name + '/tmp/test/d'
 
-
 @pytest.yield_fixture
 def s3():
     # writable local S3 system
@@ -169,6 +168,23 @@ def test_config_kwargs():
     assert s3.connect(refresh=True).meta.config.signature_version == 's3v4'
 
 
+def test_config_kwargs_class_attributes_default():
+    s3 = S3FileSystem()
+    assert s3.connect(refresh=True).meta.config.connect_timeout == 5
+    assert s3.connect(refresh=True).meta.config.read_timeout == 15
+
+
+def test_config_kwargs_class_attributes_override():
+    s3 = S3FileSystem(
+        config_kwargs={
+            "connect_timeout": 60,
+            "read_timeout": 120,
+        }
+    )
+    assert s3.connect(refresh=True).meta.config.connect_timeout == 60
+    assert s3.connect(refresh=True).meta.config.read_timeout == 120
+
+
 def test_idempotent_connect(s3):
     con1 = s3.connect()
     con2 = s3.connect(refresh=False)
@@ -208,6 +224,45 @@ def test_info(s3):
         s3.info(new_parent)
 
 
+def test_checksum(s3):
+    bucket = test_bucket_name
+    d = "checksum"
+    prefix = d+"/e"
+    o1 = prefix + "1"
+    o2 = prefix + "2"
+    path1 = bucket + "/" + o1
+    path2 = bucket + "/" + o2
+
+    client=s3.s3
+
+    # init client and files
+    client.put_object(Bucket=bucket, Key=o1, Body="")
+    client.put_object(Bucket=bucket, Key=o2, Body="")
+
+    # change one file, using cache
+    client.put_object(Bucket=bucket, Key=o1, Body="foo")
+    checksum = s3.checksum(path1)
+    s3.ls(path1) # force caching
+    client.put_object(Bucket=bucket, Key=o1, Body="bar")
+    # refresh == False => checksum doesn't change
+    assert checksum == s3.checksum(path1)
+
+    # change one file, without cache
+    client.put_object(Bucket=bucket, Key=o1, Body="foo")
+    checksum = s3.checksum(path1, refresh=True)
+    s3.ls(path1) # force caching
+    client.put_object(Bucket=bucket, Key=o1, Body="bar")
+    # refresh == True => checksum changes
+    assert checksum != s3.checksum(path1, refresh=True)
+
+
+    # Test for nonexistent file
+    client.put_object(Bucket=bucket, Key=o1, Body="bar")
+    s3.ls(path1) # force caching
+    client.delete_object(Bucket=bucket, Key=o1)
+    with pytest.raises(FileNotFoundError):
+        checksum = s3.checksum(o1, refresh=True)
+        
 test_xattr_sample_metadata = {'test_xattr': '1'}
 
 
@@ -1128,6 +1183,47 @@ def test_list_versions_many(s3):
             fo.write(b'1')
     versions = s3.object_version_info(versioned_file)
     assert len(versions) == 1200
+
+
+def test_fsspec_versions_multiple(s3):
+    """Test that the standard fsspec.core.get_fs_token_paths behaves as expected for versionId urls"""
+    s3 = S3FileSystem(anon=False, version_aware=True)
+    versioned_file = versioned_bucket_name + '/versioned_file3'
+    version_lookup = {}
+    for i in range(20):
+        contents = str(i).encode()
+        with s3.open(versioned_file, 'wb') as fo:
+            fo.write(contents)
+        version_lookup[fo.version_id] = contents
+    urls = [f"s3://{versioned_file}?versionId={version}" for version in version_lookup.keys()]
+    fs, token, paths = fsspec.core.get_fs_token_paths(urls)
+    assert isinstance(fs, S3FileSystem)
+    assert fs.version_aware
+    for path in paths:
+        with fs.open(path, 'rb') as fo:
+            contents = fo.read()
+            assert contents == version_lookup[fo.version_id]
+
+
+def test_versioned_file_fullpath(s3):
+    versioned_file = versioned_bucket_name + '/versioned_file_fullpath'
+    s3 = S3FileSystem(anon=False, version_aware=True)
+    with s3.open(versioned_file, 'wb') as fo:
+        fo.write(b'1')
+    # moto doesn't correctly return a versionId for a multipart upload. So we resort to this.
+    # version_id = fo.version_id
+    versions = s3.object_version_info(versioned_file)
+    version_ids = [version['VersionId'] for version in versions]
+    version_id = version_ids[0]
+
+    with s3.open(versioned_file, 'wb') as fo:
+        fo.write(b'2')
+
+    file_with_version = "{}?versionId={}".format(versioned_file, version_id)
+
+    with s3.open(file_with_version, 'rb') as fo:
+        assert fo.version_id == version_id
+        assert fo.read() == b'1'
 
 
 def test_versions_unaware(s3):
